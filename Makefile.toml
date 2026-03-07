@@ -1,0 +1,35 @@
+[tasks.build]
+description = "Build the Docker image with the extension"
+command = "docker"
+args = ["compose", "build"]
+
+[tasks.up]
+description = "Start PostgreSQL with the extension"
+dependencies = ["build"]
+command = "docker"
+args = ["compose", "up", "-d"]
+
+[tasks.down]
+description = "Stop PostgreSQL"
+command = "docker"
+args = ["compose", "down"]
+
+[tasks.psql]
+description = "Open a psql session"
+command = "docker"
+args = ["compose", "exec", "db", "psql", "-U", "postgres", "-d", "bitmap_index_filter"]
+
+[tasks.test-docker]
+description = "Build (tests run during build stage)"
+command = "docker"
+args = ["compose", "build"]
+
+[tasks.logs]
+description = "Tail PostgreSQL logs"
+command = "docker"
+args = ["compose", "logs", "-f", "db"]
+
+[tasks.clean]
+description = "Stop PostgreSQL and remove volumes"
+command = "docker"
+args = ["compose", "down", "-v"]

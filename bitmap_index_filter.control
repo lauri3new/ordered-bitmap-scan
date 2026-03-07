@@ -1,0 +1,5 @@
+comment = 'bitmap_index_filter: a bitmap index filter extension for PostgreSQL'
+default_version = '@CARGO_VERSION@'
+module_pathname = '$libdir/bitmap_index_filter'
+relocatable = false
+superuser = true
