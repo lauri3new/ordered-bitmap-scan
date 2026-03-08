@@ -6,6 +6,29 @@ use std::collections::HashSet;
 
 pg_module_magic!();
 
+unsafe fn snapshot_buffers() -> pg_sys::BufferUsage {
+    std::ptr::addr_of!(pg_sys::pgBufferUsage).read()
+}
+
+fn report_buffer_delta(label: &str, before: &pg_sys::BufferUsage, after: &pg_sys::BufferUsage) {
+    let mut delta: pg_sys::BufferUsage = unsafe { std::mem::zeroed() };
+    unsafe {
+        pg_sys::BufferUsageAccumDiff(
+            &mut delta,
+            after as *const pg_sys::BufferUsage as *mut pg_sys::BufferUsage,
+            before as *const pg_sys::BufferUsage as *mut pg_sys::BufferUsage,
+        );
+    }
+    notice!(
+        "{}: shared hit={} read={}, local hit={} read={}",
+        label,
+        delta.shared_blks_hit,
+        delta.shared_blks_read,
+        delta.local_blks_hit,
+        delta.local_blks_read,
+    );
+}
+
 #[pg_extern]
 fn ordered_bitmap_scan(
     table_name: &str,
@@ -15,6 +38,7 @@ fn ordered_bitmap_scan(
     filter_value: &str,
     driving_direction: default!(&str, "'forward'"),
     fetch_limit: default!(i64, 100),
+    report_buffers: default!(bool, false),
 ) -> SetOfIterator<'static, pg_sys::ItemPointerData> {
     let limit = fetch_limit.max(0) as usize;
 
@@ -132,6 +156,8 @@ fn ordered_bitmap_scan(
         );
 
         // Step 3: Build TID bitmap from filter index
+        let buf_before_filter = if report_buffers { Some(snapshot_buffers()) } else { None };
+
         let tbm = pg_sys::tbm_create(
             (pg_sys::work_mem as usize) * 1024,
             std::ptr::null_mut(),
@@ -152,6 +178,11 @@ fn ordered_bitmap_scan(
         );
         pg_sys::index_getbitmap(bitmap_scan, tbm);
         pg_sys::index_endscan(bitmap_scan);
+
+        if let Some(ref before) = buf_before_filter {
+            let after = snapshot_buffers();
+            report_buffer_delta("Filter index scan", before, &after);
+        }
 
         // Step 4: Convert bitmap to HashSet for O(1) lookup
         let mut tid_set: HashSet<u64> = HashSet::new();
@@ -185,6 +216,8 @@ fn ordered_bitmap_scan(
             "backward" => pg_sys::ScanDirection::BackwardScanDirection,
             _ => error!("driving_direction must be 'forward' or 'backward'"),
         };
+
+        let buf_before_driving = if report_buffers { Some(snapshot_buffers()) } else { None };
 
         let btree_scan = pg_sys::index_beginscan(
             heap_rel,
@@ -220,6 +253,19 @@ fn ordered_bitmap_scan(
             }
         }
         pg_sys::index_endscan(btree_scan);
+
+        if let Some(ref before) = buf_before_driving {
+            let after = snapshot_buffers();
+            report_buffer_delta("Driving index scan", before, &after);
+        }
+
+        if report_buffers {
+            notice!(
+                "ordered_bitmap_scan: {} matching TIDs returned (limit {})",
+                results.len(),
+                limit,
+            );
+        }
 
         // Step 6: Cleanup and return
         pg_sys::index_close(driving_idx, pg_sys::AccessShareLock as i32);
@@ -266,6 +312,42 @@ mod tests {
             "SELECT count(*) FROM ordered_bitmap_scan(
                 'test_obs', 'idx_test_created', 'idx_test_tsv',
                 '@@', 'fox & brown', 'forward', 10
+            )",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(count, 10);
+    }
+
+    #[pg_test]
+    fn test_ordered_bitmap_scan_with_buffer_reporting() {
+        Spi::run(
+            "CREATE TABLE test_obs_buf (
+                id serial PRIMARY KEY,
+                created_at timestamptz NOT NULL DEFAULT now(),
+                body text NOT NULL,
+                body_tsv tsvector GENERATED ALWAYS AS (to_tsvector('english', body)) STORED
+            )",
+        )
+        .unwrap();
+        Spi::run("CREATE INDEX idx_buf_created ON test_obs_buf (created_at)").unwrap();
+        Spi::run("CREATE INDEX idx_buf_tsv ON test_obs_buf USING gin (body_tsv)").unwrap();
+
+        Spi::run(
+            "INSERT INTO test_obs_buf (created_at, body)
+             SELECT '2024-01-01'::timestamptz + (i || ' minutes')::interval,
+                    CASE WHEN i % 3 = 0 THEN 'the quick brown fox jumps over the lazy dog'
+                         WHEN i % 3 = 1 THEN 'hello world from postgresql extension'
+                         ELSE 'random text about weather patterns'
+                    END
+             FROM generate_series(1, 300) AS i",
+        )
+        .unwrap();
+
+        let count = Spi::get_one::<i64>(
+            "SELECT count(*) FROM ordered_bitmap_scan(
+                'test_obs_buf', 'idx_buf_created', 'idx_buf_tsv',
+                '@@', 'fox & brown', 'forward', 10, true
             )",
         )
         .unwrap()

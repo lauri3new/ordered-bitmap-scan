@@ -29,6 +29,11 @@ description = "Tail PostgreSQL logs"
 command = "docker"
 args = ["compose", "logs", "-f", "db"]
 
+[tasks.benchmark]
+description = "Run benchmark comparing ordered_bitmap_scan vs regular query"
+command = "docker"
+args = ["compose", "exec", "-T", "db", "psql", "-U", "postgres", "-d", "bitmap_index_filter", "-f", "/sql/benchmark.sql"]
+
 [tasks.clean]
 description = "Stop PostgreSQL and remove volumes"
 command = "docker"
