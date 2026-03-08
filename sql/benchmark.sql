@@ -199,5 +199,127 @@ SELECT * FROM ordered_bitmap_scan(
 );
 
 \echo ''
-\echo '==== BENCHMARK COMPLETE ===='
+\echo '==== EXACT BITMAP BENCHMARK COMPLETE ===='
+
+------------------------------------------------------------
+-- 8. Lossy bitmap setup: insert 200K more rows (1-in-3 match)
+------------------------------------------------------------
+\echo ''
+\echo '==== LOSSY BITMAP TESTS ===='
+\echo ''
+
+INSERT INTO bench (created_at, body)
+SELECT '2024-01-03'::timestamptz + (i || ' minutes')::interval,
+       CASE i % 10
+           WHEN 0 THEN 'the monkey jumps up the tree and runs away'
+           WHEN 1 THEN 'hello world from postgresql extension development'
+           WHEN 2 THEN 'database indexing strategies for large tables'
+           WHEN 3 THEN 'concurrent transactions and isolation levels'
+           WHEN 4 THEN 'query planning and execution in postgresql'
+           WHEN 5 THEN 'partitioning large tables for better performance'
+           WHEN 6 THEN 'vacuum and autovacuum tuning guide today'
+           WHEN 7 THEN 'replication streaming logical physical setup'
+           WHEN 8 THEN 'monitoring slow queries with statistics views'
+           WHEN 9 THEN 'connection pooling configuration and setup'
+       END
+FROM generate_series(1, 250000) AS i;
+
+INSERT INTO bench (created_at, body)
+SELECT '2024-01-04'::timestamptz + (i || ' minutes')::interval,
+       CASE i % 10
+           WHEN 0 THEN 'the quick brown fox jumps over the lazy dog'
+           WHEN 1 THEN 'hello world from postgresql extension development'
+           WHEN 2 THEN 'database indexing strategies for large tables'
+           WHEN 3 THEN 'concurrent transactions and isolation levels'
+           WHEN 4 THEN 'query planning and execution in postgresql'
+           WHEN 5 THEN 'partitioning large tables for better performance'
+           WHEN 6 THEN 'vacuum and autovacuum tuning guide today'
+           WHEN 7 THEN 'replication streaming logical physical setup'
+           WHEN 8 THEN 'monitoring slow queries with statistics views'
+           WHEN 9 THEN 'connection pooling configuration and setup'
+       END
+FROM generate_series(1, 250000) AS i;
+
+ANALYZE bench;
+
+SET work_mem = '64kB';
+
+------------------------------------------------------------
+-- 9. Lossy correctness: LIMIT 100
+------------------------------------------------------------
+\echo ''
+\echo '==== LOSSY TEST CASE 1: LIMIT 100 ===='
+\echo ''
+
+CREATE TEMP TABLE lossy_regular_100 AS
+SELECT ctid::text AS tid FROM bench
+WHERE body_tsv @@ to_tsquery('english', 'fox & brown')
+ORDER BY created_at
+LIMIT 100;
+
+CREATE TEMP TABLE lossy_obs_100 AS
+SELECT ordered_bitmap_scan::text AS tid FROM ordered_bitmap_scan(
+    'bench', 'idx_bench_created', 'idx_bench_tsv',
+    '@@', 'fox & brown', 'forward', 100
+);
+
+\echo '--- Mismatches (should be 0 rows) ---'
+SELECT 'LOSSY LIMIT 100 MISMATCH' AS error, * FROM (
+    (TABLE lossy_regular_100 EXCEPT TABLE lossy_obs_100)
+    UNION ALL
+    (TABLE lossy_obs_100 EXCEPT TABLE lossy_regular_100)
+) diff;
+
+------------------------------------------------------------
+-- 10. Lossy correctness: LIMIT 1000
+------------------------------------------------------------
+\echo ''
+\echo '==== LOSSY TEST CASE 2: LIMIT 1000 ===='
+\echo ''
+
+CREATE TEMP TABLE lossy_regular_1000 AS
+SELECT ctid::text AS tid FROM bench
+WHERE body_tsv @@ to_tsquery('english', 'fox & brown')
+ORDER BY created_at
+LIMIT 1000;
+
+CREATE TEMP TABLE lossy_obs_1000 AS
+SELECT ordered_bitmap_scan::text AS tid FROM ordered_bitmap_scan(
+    'bench', 'idx_bench_created', 'idx_bench_tsv',
+    '@@', 'fox & brown', 'forward', 1000
+);
+
+\echo '--- Mismatches (should be 0 rows) ---'
+SELECT 'LOSSY LIMIT 1000 MISMATCH' AS error, * FROM (
+    (TABLE lossy_regular_1000 EXCEPT TABLE lossy_obs_1000)
+    UNION ALL
+    (TABLE lossy_obs_1000 EXCEPT TABLE lossy_regular_1000)
+) diff;
+
+------------------------------------------------------------
+-- 11. Lossy buffer comparison: EXPLAIN (ANALYZE, BUFFERS)
+------------------------------------------------------------
+\echo ''
+\echo '==== LOSSY BUFFER COMPARISON: LIMIT 1000 ===='
+\echo ''
+
+\echo '--- Regular query (LIMIT 1000, work_mem=64kB) ---'
+EXPLAIN (ANALYZE, BUFFERS)
+SELECT ctid FROM bench
+WHERE body_tsv @@ to_tsquery('english', 'fox & brown')
+ORDER BY created_at
+LIMIT 1000;
+
+\echo ''
+\echo '--- ordered_bitmap_scan (LIMIT 1000, work_mem=64kB, report_buffers=true) ---'
+EXPLAIN (ANALYZE, BUFFERS)
+SELECT * FROM ordered_bitmap_scan(
+    'bench', 'idx_bench_created', 'idx_bench_tsv',
+    '@@', 'fox & brown', 'forward', 1000, true
+);
+
+RESET work_mem;
+
+\echo ''
+\echo '==== BENCHMARK COMPLETE (exact + lossy) ===='
 

@@ -107,7 +107,7 @@ fn ordered_bitmap_scan(
 
         // Step 2: Build scan key for filter index
         let opfamily_oid = *(*filter_idx).rd_opfamily.add(0);
-        let opcintype = *(*filter_idx).rd_opcintype.add(0);
+        let _opcintype = *(*filter_idx).rd_opcintype.add(0);
 
         // Build operator name as a pg List of String nodes
         let op_cstr = filter_op.as_pg_cstr();
@@ -184,6 +184,9 @@ fn ordered_bitmap_scan(
             report_buffer_delta("Filter index scan", before, &after);
         }
 
+        // Capture the filter index's attribute number for lossy recheck
+        let filter_attnum = *(*(*filter_idx).rd_index).indkey.values.as_ptr().add(0); // i16 (AttrNumber)
+
         // Step 4: Convert bitmap to HashSet for O(1) lookup
         let mut tid_set: HashSet<u64> = HashSet::new();
         let mut lossy_blocks: HashSet<pg_sys::BlockNumber> = HashSet::new();
@@ -209,6 +212,16 @@ fn ordered_bitmap_scan(
         }
         pg_sys::tbm_end_private_iterate(iterator);
         pg_sys::tbm_free(tbm);
+
+        // Create a TupleTableSlot for heap fetches (only needed for lossy blocks)
+        let slot = if lossy_blocks.is_empty() {
+            std::ptr::null_mut()
+        } else {
+            pg_sys::MakeSingleTupleTableSlot(
+                (*heap_rel).rd_att,
+                &pg_sys::TTSOpsBufferHeapTuple as *const _ as *mut _,
+            )
+        };
 
         // Step 5: Walk B-tree in order, probe bitmap
         let direction = match driving_direction.to_lowercase().as_str() {
@@ -245,14 +258,41 @@ fn ordered_bitmap_scan(
             let key = item_pointer_to_u64(tid);
             let (blockno, _offno) = item_pointer_get_both(tid);
 
-            if tid_set.contains(&key) || lossy_blocks.contains(&blockno) {
+            if tid_set.contains(&key) {
+                // Exact bitmap match — no heap access needed
                 results.push(tid);
                 if results.len() >= limit {
                     break;
                 }
+            } else if lossy_blocks.contains(&blockno) {
+                // Lossy page — must fetch heap tuple and recheck filter condition
+                if pg_sys::index_fetch_heap(btree_scan, slot) {
+                    pg_sys::slot_getsomeattrs_int(slot, filter_attnum as i32);
+                    let col_datum = (*slot).tts_values.add(filter_attnum as usize - 1).read();
+                    let col_isnull = (*slot).tts_isnull.add(filter_attnum as usize - 1).read();
+
+                    if !col_isnull {
+                        let result_datum = pg_sys::OidFunctionCall2Coll(
+                            regproc,
+                            pg_sys::InvalidOid,
+                            col_datum,
+                            datum,
+                        );
+                        if result_datum != pg_sys::Datum::from(0usize) {
+                            results.push(tid);
+                            if results.len() >= limit {
+                                break;
+                            }
+                        }
+                    }
+                }
             }
         }
         pg_sys::index_endscan(btree_scan);
+
+        if !slot.is_null() {
+            pg_sys::ExecDropSingleTupleTableSlot(slot);
+        }
 
         if let Some(ref before) = buf_before_driving {
             let after = snapshot_buffers();
@@ -273,6 +313,14 @@ fn ordered_bitmap_scan(
         pg_sys::table_close(heap_rel, pg_sys::AccessShareLock as i32);
 
         SetOfIterator::new(results)
+    }
+}
+
+#[cfg(test)]
+pub mod pg_test {
+    pub fn setup(_options: Vec<&str>) {}
+    pub fn postgresql_conf_options() -> Vec<&'static str> {
+        vec![]
     }
 }
 
@@ -353,5 +401,59 @@ mod tests {
         .unwrap()
         .unwrap();
         assert_eq!(count, 10);
+    }
+
+    #[pg_test]
+    fn test_ordered_bitmap_scan_lossy() {
+        // Force lossy bitmaps by setting work_mem very low
+        Spi::run("SET work_mem = '64kB'").unwrap();
+
+        Spi::run(
+            "CREATE TABLE test_obs_lossy (
+                id serial PRIMARY KEY,
+                created_at timestamptz NOT NULL DEFAULT now(),
+                body text NOT NULL,
+                body_tsv tsvector GENERATED ALWAYS AS (to_tsvector('english', body)) STORED
+            )",
+        )
+        .unwrap();
+        Spi::run("CREATE INDEX idx_lossy_created ON test_obs_lossy (created_at)").unwrap();
+        Spi::run("CREATE INDEX idx_lossy_tsv ON test_obs_lossy USING gin (body_tsv)").unwrap();
+
+        // Insert enough rows so the bitmap exceeds 64kB and goes lossy
+        // ~3,333 matches out of 10,000 rows
+        Spi::run(
+            "INSERT INTO test_obs_lossy (created_at, body)
+             SELECT '2024-01-01'::timestamptz + (i || ' seconds')::interval,
+                    CASE WHEN i % 3 = 0 THEN 'the quick brown fox jumps over the lazy dog'
+                         WHEN i % 3 = 1 THEN 'hello world from postgresql extension'
+                         ELSE 'random text about weather patterns'
+                    END
+             FROM generate_series(1, 10000) AS i",
+        )
+        .unwrap();
+
+        // Get the true count from a regular query
+        let expected = Spi::get_one::<i64>(
+            "SELECT count(*) FROM test_obs_lossy WHERE body_tsv @@ to_tsquery('english', 'fox & brown')",
+        )
+        .unwrap()
+        .unwrap();
+
+        // Get the count from ordered_bitmap_scan with a high limit
+        let actual = Spi::get_one::<i64>(
+            "SELECT count(*) FROM ordered_bitmap_scan(
+                'test_obs_lossy', 'idx_lossy_created', 'idx_lossy_tsv',
+                '@@', 'fox & brown', 'forward', 10000
+            )",
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(
+            actual, expected,
+            "lossy bitmap recheck: ordered_bitmap_scan returned {} rows but expected {}",
+            actual, expected
+        );
     }
 }

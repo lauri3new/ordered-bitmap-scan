@@ -36,6 +36,7 @@ COPY sql/ sql/
 RUN cargo pgrx install --release \
     --pg-config "$(find /root/.pgrx -path '*/18.*/pgrx-install/bin/pg_config' | head -1)"
 
+
 # Stage extension files for the runtime image
 RUN PG_CONFIG="$(find /root/.pgrx -path '*/18.*/pgrx-install/bin/pg_config' | head -1)" && \
     mkdir -p /staging/extension /staging/lib && \
